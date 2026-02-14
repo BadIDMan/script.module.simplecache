@@ -11,6 +11,7 @@ import xbmcaddon
 import datetime
 import time
 import sqlite3
+import json
 from functools import reduce
 
 ADDON_ID = "script.module.simplecache"
@@ -18,6 +19,7 @@ ADDON_ID = "script.module.simplecache"
 class SimpleCache(object):
     '''simple stateless caching system for Kodi'''
     enable_mem_cache = True
+    data_is_json = False
     global_checksum = None
     _exit = False
     _auto_clean_interval = datetime.timedelta(hours=4)
@@ -29,100 +31,90 @@ class SimpleCache(object):
         '''Initialize our caching class'''
         self._win = xbmcgui.Window(10000)
         self._monitor = xbmc.Monitor()
+        self._database = None
         self.check_cleanup()
         self._log_msg("Initialized")
 
     def close(self):
         '''tell any tasks to stop immediately (as we can be called multithreaded) and cleanup objects'''
         self._exit = True
-        # wait for all tasks to complete
         while self._busy_tasks and not self._monitor.abortRequested():
             xbmc.sleep(25)
+
+        if self._database:
+            try:
+                self._database.commit()
+                self._database.close()
+            except Exception:
+                pass
+            self._database = None
+
         del self._win
         del self._monitor
         self._log_msg("Closed")
 
     def __del__(self):
-        '''make sure close is called'''
         if not self._exit:
             self.close()
 
-    def get(self, endpoint, checksum=""):
-        '''
-            get object from cache and return the results
-            endpoint: the (unique) name of the cache object as reference
-            checkum: optional argument to check if the checksum in the cacheobject matches the checkum provided
-        '''
+    def get(self, endpoint, checksum="", json_data=False):
         checksum = self._get_checksum(checksum)
         cur_time = self._get_timestamp(datetime.datetime.now())
         result = None
-        # 1: try memory cache first
-        if self.enable_mem_cache:
-            result = self._get_mem_cache(endpoint, checksum, cur_time)
 
-        # 2: fallback to _database cache
+        if self.enable_mem_cache:
+            result = self._get_mem_cache(endpoint, checksum, cur_time, json_data)
+
         if result is None:
-            result = self._get_db_cache(endpoint, checksum, cur_time)
+            result = self._get_db_cache(endpoint, checksum, cur_time, json_data)
 
         return result
 
-    def set(self, endpoint, data, checksum="", expiration=datetime.timedelta(days=30)):
-        '''
-            set data in cache
-        '''
+    def set(self, endpoint, data, checksum="", expiration=datetime.timedelta(days=30), json_data=False):
         task_name = "set.%s" % endpoint
         self._busy_tasks.append(task_name)
         checksum = self._get_checksum(checksum)
         expires = self._get_timestamp(datetime.datetime.now() + expiration)
 
-        # memory cache: write to window property
         if self.enable_mem_cache and not self._exit:
-            self._set_mem_cache(endpoint, checksum, expires, data)
+            self._set_mem_cache(endpoint, checksum, expires, data, json_data)
 
-        # db cache
         if not self._exit:
-            self._set_db_cache(endpoint, checksum, expires, data)
+            self._set_db_cache(endpoint, checksum, expires, data, json_data)
 
-        # remove this task from list
         self._busy_tasks.remove(task_name)
 
     def check_cleanup(self):
-        '''check if cleanup is needed - public method, may be called by calling addon'''
         cur_time = datetime.datetime.now()
         lastexecuted = self._win.getProperty("simplecache.clean.lastexecuted")
         if not lastexecuted:
             self._win.setProperty("simplecache.clean.lastexecuted", repr(cur_time))
         elif (eval(lastexecuted) + self._auto_clean_interval) < cur_time:
-            # cleanup needed...
             self._do_cleanup()
 
-    def _get_mem_cache(self, endpoint, checksum, cur_time):
-        '''
-            get cache data from memory cache
-            we use window properties because we need to be stateless
-        '''
+    def _get_mem_cache(self, endpoint, checksum, cur_time, json_data):
         result = None
         cachedata = self._win.getProperty(endpoint)
 
         if cachedata:
-            cachedata = eval(cachedata)
+            if json_data or self.data_is_json:
+                cachedata = json.loads(cachedata)
+            else:
+                cachedata = eval(cachedata)
             if cachedata[0] > cur_time:
                 if not checksum or checksum == cachedata[2]:
                     result = cachedata[1]
         return result
 
-    def _set_mem_cache(self, endpoint, checksum, expires, data):
-        '''
-            window property cache as alternative for memory cache
-            usefull for (stateless) plugins
-        '''
+    def _set_mem_cache(self, endpoint, checksum, expires, data, json_data):
         cachedata = (expires, data, checksum)
-        cachedata_str = repr(cachedata)
+        if json_data or self.data_is_json:
+            cachedata_str = json.dumps(cachedata)
+        else:
+            cachedata_str = repr(cachedata)
         self._win.setProperty(endpoint, cachedata_str)
 
-
-    def _get_db_cache(self, endpoint, checksum, cur_time):
-        '''get cache data from sqllite _database'''
+    def _get_db_cache(self, endpoint, checksum, cur_time, json_data):
         result = None
         query = "SELECT expires, data, checksum FROM simplecache WHERE id = ?"
         cache_data = self._execute_sql(query, (endpoint,))
@@ -130,20 +122,23 @@ class SimpleCache(object):
             cache_data = cache_data.fetchone()
             if cache_data and cache_data[0] > cur_time:
                 if not checksum or cache_data[2] == checksum:
-                    result = eval(cache_data[1])
-                    # also set result in memory cache for further access
+                    if json_data or self.data_is_json:
+                        result = json.loads(cache_data[1])
+                    else:
+                        result = eval(cache_data[1])
                     if self.enable_mem_cache:
-                        self._set_mem_cache(endpoint, checksum, cache_data[0], result)
+                        self._set_mem_cache(endpoint, checksum, cache_data[0], result, json_data)
         return result
 
-    def _set_db_cache(self, endpoint, checksum, expires, data):
-        ''' store cache data in _database '''
+    def _set_db_cache(self, endpoint, checksum, expires, data, json_data):
         query = "INSERT OR REPLACE INTO simplecache( id, expires, data, checksum) VALUES (?, ?, ?, ?)"
-        data = repr(data)
+        if json_data or self.data_is_json:
+            data = json.dumps(data)
+        else:
+            data = repr(data)
         self._execute_sql(query, (endpoint, expires, data, checksum))
 
     def _do_cleanup(self):
-        '''perform cleanup task'''
         if self._exit or self._monitor.abortRequested():
             return
         self._busy_tasks.append(__name__)
@@ -155,33 +150,33 @@ class SimpleCache(object):
         self._win.setProperty("simplecachecleanbusy", "busy")
 
         query = "SELECT id, expires FROM simplecache"
-        for cache_data in self._execute_sql(query).fetchall():
-            cache_id = cache_data[0]
-            cache_expires = cache_data[1]
+        cursor = self._execute_sql(query)
+        if cursor:
+            for cache_data in cursor.fetchall():
+                cache_id = cache_data[0]
+                cache_expires = cache_data[1]
 
-            if self._exit or self._monitor.abortRequested():
-                return
+                if self._exit or self._monitor.abortRequested():
+                    return
 
-            # always cleanup all memory objects on each interval
-            self._win.clearProperty(cache_id)
+                self._win.clearProperty(cache_id)
 
-            # clean up db cache object only if expired
-            if cache_expires < cur_timestamp:
-                query = 'DELETE FROM simplecache WHERE id = ?'
-                self._execute_sql(query, (cache_id,))
-                self._log_msg("delete from db %s" % cache_id)
+                if cache_expires < cur_timestamp:
+                    delete_query = 'DELETE FROM simplecache WHERE id = ?'
+                    self._execute_sql(delete_query, (cache_id,))
+                    self._log_msg("delete from db %s" % cache_id)
 
-        # compact db
         self._execute_sql("VACUUM")
 
-        # remove task from list
         self._busy_tasks.remove(__name__)
         self._win.setProperty("simplecache.clean.lastexecuted", repr(cur_time))
         self._win.clearProperty("simplecachecleanbusy")
         self._log_msg("Auto cleanup done")
 
     def _get_database(self):
-        '''get reference to our sqllite _database - performs basic integrity check'''
+        if self._database:
+            return self._database
+
         addon = xbmcaddon.Addon(ADDON_ID)
         dbpath = addon.getAddonInfo('profile')
         dbfile = xbmcvfs.translatePath("%s/simplecache.db" % dbpath)
@@ -189,67 +184,82 @@ class SimpleCache(object):
         if not xbmcvfs.exists(dbpath):
             xbmcvfs.mkdirs(dbpath)
         del addon
+
         try:
-            connection = sqlite3.connect(dbfile, timeout=30, isolation_level=None)
+            connection = sqlite3.connect(
+                dbfile,
+                timeout=30,
+                check_same_thread=False
+            )
+            connection.execute("PRAGMA journal_mode=WAL;")
+            connection.execute("PRAGMA synchronous=NORMAL;")
+            connection.execute("PRAGMA busy_timeout=30000;")
             connection.execute('SELECT * FROM simplecache LIMIT 1')
-            return connection
-        except Exception as error:
-            # our _database is corrupt or doesn't exist yet, we simply try to recreate it
+            self._database = connection
+            return self._database
+        except Exception:
             if xbmcvfs.exists(dbfile):
                 xbmcvfs.delete(dbfile)
-            try:
-                connection = sqlite3.connect(dbfile, timeout=30, isolation_level=None)
-                connection.execute(
-                    """CREATE TABLE IF NOT EXISTS simplecache(
+            connection = sqlite3.connect(
+                dbfile,
+                timeout=30,
+                check_same_thread=False
+            )
+            connection.execute("""CREATE TABLE IF NOT EXISTS simplecache(
                     id TEXT UNIQUE, expires INTEGER, data TEXT, checksum INTEGER)""")
-                return connection
-            except Exception as error:
-                self._log_msg("Exception while initializing _database: %s" % str(error), xbmc.LOGWARNING)
-                self.close()
-                return None
+            connection.execute("PRAGMA journal_mode=WAL;")
+            connection.execute("PRAGMA synchronous=NORMAL;")
+            connection.execute("PRAGMA busy_timeout=30000;")
+            self._database = connection
+            return self._database
 
     def _execute_sql(self, query, data=None):
-        '''little wrapper around execute and executemany to just retry a db command if db is locked'''
         retries = 0
-        result = None
-        error = None
-        # always use new db object because we need to be sure that data is available for other simplecache instances
-        with self._get_database() as _database:
-            while not retries == 10 and not self._monitor.abortRequested():
-                if self._exit:
-                    return None
-                try:
-                    if isinstance(data, list):
-                        result = _database.executemany(query, data)
-                    elif data:
-                        result = _database.execute(query, data)
-                    else:
-                        result = _database.execute(query)
-                    return result
-                except sqlite3.OperationalError as error:
-                    if "_database is locked" in error:
-                        self._log_msg("retrying DB commit...")
-                        retries += 1
-                        self._monitor.waitForAbort(0.5)
-                    else:
-                        break
-                except Exception as error:
+        last_error = None
+
+        _database = self._get_database()
+
+        while retries < 10 and not self._monitor.abortRequested():
+            if self._exit:
+                return None
+            try:
+                if isinstance(data, list):
+                    result = _database.executemany(query, data)
+                elif data:
+                    result = _database.execute(query, data)
+                else:
+                    result = _database.execute(query)
+
+                _database.commit()
+                return result
+
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if "locked" in str(exc).lower():
+                    self._log_msg("retrying DB commit...")
+                    retries += 1
+                    self._monitor.waitForAbort(0.5)
+                else:
                     break
-            self._log_msg("_database ERROR ! -- %s" % str(error), xbmc.LOGWARNING)
+
+            except Exception as exc:
+                last_error = exc
+                break
+
+        if last_error:
+            self._log_msg("_database ERROR ! -- %s" % str(last_error), xbmc.LOGWARNING)
+
         return None
 
     @staticmethod
     def _log_msg(msg, loglevel=xbmc.LOGDEBUG):
-        '''helper to send a message to the kodi log'''
         xbmc.log("Skin Helper Simplecache --> %s" % msg, level=loglevel)
 
     @staticmethod
     def _get_timestamp(date_time):
-        '''Converts a datetime object to unix timestamp'''
         return int(time.mktime(date_time.timetuple()))
 
     def _get_checksum(self, stringinput):
-        '''get int checksum from string'''
         if not stringinput and not self.global_checksum:
             return 0
         if self.global_checksum:
@@ -260,21 +270,11 @@ class SimpleCache(object):
 
 
 def use_cache(cache_days=14):
-    '''
-        wrapper around our simple cache to use as decorator
-        Usage: define an instance of SimpleCache with name "cache" (self.cache) in your class
-        Any method that needs caching just add @use_cache as decorator
-        NOTE: use unnamed arguments for calling the method and named arguments for optional settings
-    '''
     def decorator(func):
-        '''our decorator'''
         def decorated(*args, **kwargs):
-            '''process the original method and apply caching of the results'''
             method_class = args[0]
             method_class_name = method_class.__class__.__name__
             cache_str = "%s.%s" % (method_class_name, func.__name__)
-            # cache identifier is based on positional args only
-            # named args are considered optional and ignored
             for item in args[1:]:
                 cache_str += u".%s" % item
             cache_str = cache_str.lower()
